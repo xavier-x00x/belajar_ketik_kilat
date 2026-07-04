@@ -67,6 +67,10 @@ export default function App() {
   // Persistent, low-latency AudioContext ref to avoid re-creation warnings & lags
   const audioCtxRef = useRef<AudioContext | null>(null);
 
+  // Refs for tracking start and end times to calculate precise high-resolution WPM
+  const startTimeRef = useRef<number | null>(null);
+  const endTimeRef = useRef<number | null>(null);
+
   // Initialize errors array whenever a new lesson is loaded
   useEffect(() => {
     resetPractice(activeLesson);
@@ -229,18 +233,18 @@ export default function App() {
   useEffect(() => {
     if (isStarted && !isFinished) {
       timerRef.current = setInterval(() => {
-        setTimeElapsed((prev) => {
-          const next = prev + 1;
-          // Calculate WPM in real-time
-          // Average word length is standard 5 characters
-          const minutes = next / 60;
-          if (minutes > 0) {
+        if (startTimeRef.current) {
+          const elapsedMs = Date.now() - startTimeRef.current;
+          const elapsedSecs = Math.floor(elapsedMs / 1000);
+          setTimeElapsed(elapsedSecs);
+
+          const minutes = elapsedMs / 1000 / 60;
+          if (minutes > 0.005) { // Avoid huge WPM spike immediately on start
             const calculatedWpm = Math.round((correctCount / 5) / minutes);
             setWpm(calculatedWpm);
           }
-          return next;
-        });
-      }, 1000);
+        }
+      }, 500);
     }
 
     return () => {
@@ -272,6 +276,8 @@ export default function App() {
 
   const resetPractice = (lesson: Lesson = activeLesson) => {
     if (timerRef.current) clearInterval(timerRef.current);
+    startTimeRef.current = null;
+    endTimeRef.current = null;
     setCharIndex(0);
     setCorrectCount(0);
     setIncorrectCount(0);
@@ -310,6 +316,8 @@ export default function App() {
     // Start timer on first keypress
     if (!isStarted) {
       setIsStarted(true);
+      startTimeRef.current = Date.now();
+      endTimeRef.current = null;
     }
 
     const lessonText = activeLesson.text;
@@ -333,8 +341,10 @@ export default function App() {
           return next;
         });
 
+        let newCorrectCount = correctCount;
         if (wasCorrect) {
-          setCorrectCount((prev) => Math.max(0, prev - 1));
+          newCorrectCount = Math.max(0, correctCount - 1);
+          setCorrectCount(newCorrectCount);
         } else {
           setIncorrectCount((prev) => Math.max(0, prev - 1));
         }
@@ -342,6 +352,16 @@ export default function App() {
         setLastPressedKey("backspace");
         setIsLastPressedError(false);
         playKeyboardSound(false);
+
+        // Recalculate WPM immediately on backspace
+        if (startTimeRef.current) {
+          const elapsedMs = Date.now() - startTimeRef.current;
+          const minutes = elapsedMs / 1000 / 60;
+          if (minutes > 0.005) {
+            const currentWpm = Math.round((newCorrectCount / 5) / minutes);
+            setWpm(currentWpm);
+          }
+        }
       }
       return;
     }
@@ -356,9 +376,11 @@ export default function App() {
     setTotalKeystrokes((prev) => prev + 1);
 
     const isCorrect = pressedKey === targetChar;
+    let nextCorrectCount = correctCount;
 
     if (isCorrect) {
-      setCorrectCount((prev) => prev + 1);
+      nextCorrectCount = correctCount + 1;
+      setCorrectCount(nextCorrectCount);
       setErrorsList((prev) => {
         const next = [...prev];
         next[charIndex] = false;
@@ -385,9 +407,29 @@ export default function App() {
 
     const nextIndex = charIndex + 1;
     if (nextIndex >= lessonText.length) {
+      const endTime = Date.now();
+      endTimeRef.current = endTime;
       setIsFinished(true);
+
+      if (startTimeRef.current) {
+        const totalElapsedMs = endTime - startTimeRef.current;
+        const totalMinutes = totalElapsedMs / 1000 / 60;
+        const finalWpm = totalMinutes > 0 ? Math.round((nextCorrectCount / 5) / totalMinutes) : 0;
+        setWpm(finalWpm);
+
+        const finalSeconds = Math.max(1, Math.round(totalElapsedMs / 1000));
+        setTimeElapsed(finalSeconds);
+      }
     } else {
       setCharIndex(nextIndex);
+      if (startTimeRef.current) {
+        const elapsedMs = Date.now() - startTimeRef.current;
+        const minutes = elapsedMs / 1000 / 60;
+        if (minutes > 0.005) {
+          const currentWpm = Math.round((nextCorrectCount / 5) / minutes);
+          setWpm(currentWpm);
+        }
+      }
     }
   };
 
@@ -406,6 +448,29 @@ export default function App() {
   const progressPercent = activeLesson.text.length > 0 
     ? Math.round((charIndex / activeLesson.text.length) * 100) 
     : 0;
+
+  // Group characters into word tokens to prevent broken word layouts across lines
+  const wordTokens = React.useMemo(() => {
+    const tokens: Array<{ type: "word" | "space"; chars: Array<{ char: string; index: number }> }> = [];
+    let currentWordChars: Array<{ char: string; index: number }> = [];
+
+    for (let i = 0; i < activeLesson.text.length; i++) {
+      const char = activeLesson.text[i];
+      if (char === " ") {
+        if (currentWordChars.length > 0) {
+          tokens.push({ type: "word", chars: currentWordChars });
+          currentWordChars = [];
+        }
+        tokens.push({ type: "space", chars: [{ char: " ", index: i }] });
+      } else {
+        currentWordChars.push({ char, index: i });
+      }
+    }
+    if (currentWordChars.length > 0) {
+      tokens.push({ type: "word", chars: currentWordChars });
+    }
+    return tokens;
+  }, [activeLesson.text]);
 
   return (
     <div 
@@ -537,38 +602,76 @@ export default function App() {
               id="typing-text-stage"
               className="text-2xl sm:text-3xl font-light leading-relaxed tracking-wide text-slate-600 font-sans break-words my-6 select-none relative"
             >
-              {activeLesson.text.split("").map((char, index) => {
-                let colorClass = "text-slate-500";
-                let underlineClass = "";
-                let isCurrent = index === charIndex;
+              {wordTokens.map((token, tokenIdx) => {
+                if (token.type === "space") {
+                  const charNode = token.chars[0];
+                  const index = charNode.index;
+                  let colorClass = "text-slate-500";
+                  let isCurrent = index === charIndex;
 
-                if (index < charIndex) {
-                  // Already typed
-                  const isError = errorsList[index];
-                  if (isError) {
-                    colorClass = "text-rose-400 bg-rose-500/10 font-semibold border-b-2 border-rose-500";
-                  } else {
-                    colorClass = "text-slate-100 font-medium";
+                  if (index < charIndex) {
+                    // Already typed
+                    const isError = errorsList[index];
+                    if (isError) {
+                      colorClass = "text-rose-400 bg-rose-500/10 font-semibold border-b-2 border-rose-500";
+                    } else {
+                      colorClass = "text-slate-100 font-medium";
+                    }
+                  } else if (isCurrent) {
+                    colorClass = "text-cyan-400 bg-cyan-500/10 px-0.5 rounded-md font-bold border-b-4 border-cyan-400 animate-pulse";
                   }
-                } else if (isCurrent) {
-                  colorClass = "text-cyan-400 bg-cyan-500/10 px-0.5 rounded-md font-bold border-b-4 border-cyan-400 animate-pulse";
-                }
 
-                return (
-                  <span 
-                    key={index} 
-                    className={`${colorClass} ${underlineClass} transition-all duration-150 relative inline-block`}
-                    id={`char-${index}`}
-                  >
-                    {/* Render visual spaces elegantly to allow smooth flow */}
-                    {char === " " ? "␣" : char}
-                    
-                    {/* Pulsing indicator under cursor */}
-                    {isCurrent && (
-                      <span className="absolute left-0 right-0 -bottom-1 h-1 bg-cyan-400 animate-bounce" />
-                    )}
-                  </span>
-                );
+                  return (
+                    <span 
+                      key={`space-${index}`} 
+                      className={`${colorClass} transition-all duration-150 relative inline-block`}
+                      id={`char-${index}`}
+                    >
+                      ␣
+                      {/* Pulsing indicator under cursor */}
+                      {isCurrent && (
+                        <span className="absolute left-0 right-0 -bottom-1 h-1 bg-cyan-400 animate-bounce" />
+                      )}
+                    </span>
+                  );
+                } else {
+                  return (
+                    <span key={`word-${tokenIdx}`} className="inline-block whitespace-nowrap">
+                      {token.chars.map((charNode) => {
+                        const index = charNode.index;
+                        let colorClass = "text-slate-500";
+                        let isCurrent = index === charIndex;
+
+                        if (index < charIndex) {
+                          // Already typed
+                          const isError = errorsList[index];
+                          if (isError) {
+                            colorClass = "text-rose-400 bg-rose-500/10 font-semibold border-b-2 border-rose-500";
+                          } else {
+                            colorClass = "text-slate-100 font-medium";
+                          }
+                        } else if (isCurrent) {
+                          colorClass = "text-cyan-400 bg-cyan-500/10 px-0.5 rounded-md font-bold border-b-4 border-cyan-400 animate-pulse";
+                        }
+
+                        return (
+                          <span 
+                            key={index} 
+                            className={`${colorClass} transition-all duration-150 relative inline-block`}
+                            id={`char-${index}`}
+                          >
+                            {charNode.char}
+                            
+                            {/* Pulsing indicator under cursor */}
+                            {isCurrent && (
+                              <span className="absolute left-0 right-0 -bottom-1 h-1 bg-cyan-400 animate-bounce" />
+                            )}
+                          </span>
+                        );
+                      })}
+                    </span>
+                  );
+                }
               })}
             </div>
 
