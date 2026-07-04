@@ -1,0 +1,6 @@
+{
+  "name": "Aplikasi Belajar Ketik",
+  "description": "Aplikasi belajar mengetik interaktif dengan tantangan kecepatan, akurasi, keyboard virtual, dan latihan kustom bertenaga AI untuk pemula.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
